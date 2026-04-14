@@ -43,6 +43,31 @@ def test_max_pressure_prefers_higher_pressure_phase():
     assert decisions[0].phase_id == "NS"
 
 
+def test_max_pressure_can_prioritize_waiting_bus():
+    network = build_synthetic_grid(seed=8)
+    demand = generate_demand_profile(network, seed=8, horizon_s=180, trip_count=80)
+    controller = MaxPressureController(decision_interval_s=6)
+    controller.initialize(network, demand)
+    node_id = network.signal_node_ids()[0]
+    incoming = network.incoming_edges(node_id)
+    vertical = [edge.id for edge in incoming if edge.orientation == "vertical"]
+    horizontal = [edge.id for edge in incoming if edge.orientation == "horizontal"]
+
+    decisions = controller.decide(
+        {
+            "time_s": 0,
+            "node_queues": {node_id: {"NS": 2, "EW": 2}},
+            "node_edges": {node_id: {"NS": vertical, "EW": horizontal}},
+            "downstream_queues": {edge_id: 1 for edge_id in vertical + horizontal},
+            "edge_queues": {edge_id: 2 for edge_id in vertical + horizontal},
+            "edge_bus_queues": {edge_id: (1 if edge_id in vertical else 0) for edge_id in vertical + horizontal},
+            "node_phase_started": {node_id: 0},
+        }
+    )
+
+    assert decisions[0].phase_id == "NS"
+
+
 def test_ga_optimizer_returns_timing_map():
     network = build_synthetic_grid(seed=4)
     demand = generate_demand_profile(network, seed=4, horizon_s=180, trip_count=90)
@@ -58,4 +83,3 @@ def test_ga_optimizer_returns_timing_map():
 
     assert set(timings.keys()) == set(network.signal_node_ids())
     assert all(6 <= phase_map["NS"] <= 32 and 6 <= phase_map["EW"] <= 32 for phase_map in timings.values())
-

@@ -38,7 +38,7 @@ class BaseController(ABC):
         raise NotImplementedError
 
     def objective_metrics(self) -> List[str]:
-        return ["avg_travel_time_s", "throughput", "avg_queue_len_m"]
+        return ["city_flow_score", "avg_travel_time_s", "bus_avg_travel_time_s", "throughput", "avg_queue_len_m"]
 
 
 class FixedTimeController(BaseController):
@@ -159,10 +159,14 @@ class MaxPressureController(BaseController):
             node_edges = sim_state.get("node_edges", {}).get(node_id, {"NS": [], "EW": []})
             for phase in ("NS", "EW"):
                 pressure = 0.0
+                bus_priority_bonus = 0.0
+                node_metadata = self.network.nodes[node_id].metadata if self.network else {}
+                priority_multiplier = 1.8 if node_metadata.get("signal_override", {}).get("mode") == "bus_priority" else 1.0
                 for edge_id in node_edges.get(phase, []):
                     downstream = sim_state["downstream_queues"].get(edge_id, 0)
                     pressure += sim_state["edge_queues"].get(edge_id, 0) - downstream
-                phase_scores[phase] = pressure
+                    bus_priority_bonus += sim_state.get("edge_bus_queues", {}).get(edge_id, 0) * 4.5 * priority_multiplier
+                phase_scores[phase] = pressure + bus_priority_bonus
             best_phase = max(phase_scores, key=phase_scores.get)
             state.phase_id = best_phase
             state.remaining_s = self.decision_interval_s - 1

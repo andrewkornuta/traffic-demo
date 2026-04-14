@@ -41,6 +41,8 @@ class TripRequest:
     origin: str
     destination: str
     departure_s: int
+    vehicle_type: str = "car"
+    route_name: str | None = None
 
 
 @dataclass
@@ -187,4 +189,3 @@ class TrafficNetwork:
 
 def flatten(iterable: Iterable[Iterable[Any]]) -> List[Any]:
     return [item for group in iterable for item in group]
-

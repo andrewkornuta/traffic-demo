@@ -9,6 +9,9 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from traffic_simulator.schemas import (
+    AnalystResponse,
+    AnalystRunRequest,
+    AnalystStudyRequest,
     MetricsResponse,
     NetworkLoadRequest,
     NetworkSummary,
@@ -17,10 +20,13 @@ from traffic_simulator.schemas import (
     ScenarioCreateRequest,
     ScenarioResponse,
     ScenarioRunRequest,
+    ScenarioStudyRequest,
     SimulationRunRequest,
     SimulationRunResponse,
 )
 from traffic_simulator.services import (
+    analyze_run_comparison,
+    analyze_scenario_study,
     create_scenario,
     get_run_metrics,
     get_run_replay,
@@ -28,8 +34,10 @@ from traffic_simulator.services import (
     list_recent_runs,
     load_network,
     parse_scenario,
+    list_scenario_templates,
     run_network_simulation,
     run_scenario_batch,
+    run_scenario_study,
     ui_config_payload,
     export_comparison_gif,
 )
@@ -44,7 +52,9 @@ app.add_middleware(
 )
 
 frontend_dir = Path(__file__).resolve().parent / "frontend"
+docs_dir = Path(__file__).resolve().parents[2] / "docs"
 app.mount("/demo", StaticFiles(directory=frontend_dir, html=True), name="demo")
+app.mount("/project-docs", StaticFiles(directory=docs_dir), name="project-docs")
 
 
 @app.on_event("startup")
@@ -70,6 +80,22 @@ def runs() -> list[dict]:
 @app.get("/ui-config")
 def ui_config() -> dict:
     return ui_config_payload()
+
+
+@app.post("/analysis/study-summary", response_model=AnalystResponse)
+def analyst_study_summary_endpoint(payload: AnalystStudyRequest) -> AnalystResponse:
+    try:
+        return AnalystResponse(**analyze_scenario_study(payload.study, payload.question, payload.network_name))
+    except Exception as exc:  # pragma: no cover - API wrapper
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/analysis/run-summary", response_model=AnalystResponse)
+def analyst_run_summary_endpoint(payload: AnalystRunRequest) -> AnalystResponse:
+    try:
+        return AnalystResponse(**analyze_run_comparison(payload.run_ids, payload.question))
+    except Exception as exc:  # pragma: no cover - API wrapper
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/networks/load", response_model=NetworkSummary)
@@ -121,6 +147,14 @@ def parse_proposal_endpoint(payload: ProposalParseRequest) -> ScenarioResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/scenarios/templates")
+def scenario_templates_endpoint(network_id: str, demand_profile_id: Optional[str] = None) -> list[dict]:
+    try:
+        return list_scenario_templates(network_id, demand_profile_id)
+    except Exception as exc:  # pragma: no cover - API wrapper
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/scenarios/{scenario_id}/run")
 def run_scenario_endpoint(scenario_id: str, payload: ScenarioRunRequest) -> dict:
     try:
@@ -128,6 +162,21 @@ def run_scenario_endpoint(scenario_id: str, payload: ScenarioRunRequest) -> dict
             payload.network_id,
             scenario_id,
             payload.controller_mode,
+            payload.duration_s,
+            payload.seeds,
+            payload.demand_profile_id,
+        )
+    except Exception as exc:  # pragma: no cover - API wrapper
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/scenarios/{scenario_id}/study")
+def run_scenario_study_endpoint(scenario_id: str, payload: ScenarioStudyRequest) -> dict:
+    try:
+        return run_scenario_study(
+            payload.network_id,
+            scenario_id,
+            payload.controller_modes,
             payload.duration_s,
             payload.seeds,
             payload.demand_profile_id,
@@ -169,9 +218,9 @@ def replay_endpoint(run_id: str) -> ReplayResponse:
 
 
 @app.get("/runs/export-gif")
-def export_gif(primary: str, comparison: Optional[str] = None) -> FileResponse:
+def export_gif(primary: str, comparison: Optional[str] = None, tertiary: Optional[str] = None) -> FileResponse:
     try:
-        path = export_comparison_gif(primary, comparison)
+        path = export_comparison_gif(primary, comparison, tertiary)
         return FileResponse(path, filename=path.name, media_type="image/gif")
     except Exception as exc:  # pragma: no cover - API wrapper
         raise HTTPException(status_code=400, detail=str(exc)) from exc

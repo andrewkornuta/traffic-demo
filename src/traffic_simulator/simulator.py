@@ -27,6 +27,9 @@ class Vehicle:
     entered_at_s: int
     total_free_flow_s: int
     departed_at_s: int
+    vehicle_type: str = "car"
+    route_name: str | None = None
+    size_units: float = 1.0
     finished_at_s: int | None = None
 
 
@@ -137,6 +140,9 @@ class TrafficSimulation:
                 entered_at_s=time_s,
                 total_free_flow_s=free_flow,
                 departed_at_s=time_s,
+                vehicle_type=trip.vehicle_type,
+                route_name=trip.route_name,
+                size_units=2.5 if trip.vehicle_type == "bus" else 1.0,
             )
             self.edge_active[first_edge.id].append(vehicle)
             self.active_vehicles[vehicle.id] = vehicle
@@ -192,7 +198,7 @@ class TrafficSimulation:
                 allowed_edges = [edge for edge in incoming_edges if self._phase_allows_edge(phase, edge.id)]
                 node_capacity = max(1, len(allowed_edges))
             moved = 0
-            for edge in sorted(allowed_edges, key=lambda entry: len(self.edge_queues[entry.id]), reverse=True):
+            for edge in sorted(allowed_edges, key=lambda entry: self._queue_units(self.edge_queues[entry.id]), reverse=True):
                 edge_capacity = max(1, edge.lane_count)
                 if self._incident_active(edge.id, time_s):
                     edge_capacity = max(0, math.floor(edge_capacity * self._incident_capacity_multiplier(edge.id, time_s)))
@@ -289,15 +295,22 @@ class TrafficSimulation:
 
     def _build_sim_state(self, time_s: int) -> Dict[str, Any]:
         node_queues = defaultdict(lambda: {"NS": 0, "EW": 0})
+        node_bus_queues = defaultdict(lambda: {"NS": 0, "EW": 0})
         node_edges = defaultdict(lambda: {"NS": [], "EW": []})
         downstream_queues = {}
+        edge_bus_queues = {}
         for edge_id, queue in self.edge_queues.items():
             edge = self.network.edges[edge_id]
             bucket = "NS" if edge.orientation == "vertical" else "EW"
-            node_queues[edge.target][bucket] += len(queue)
+            queue_units = self._queue_units(queue)
+            bus_queue_count = sum(1 for vehicle in queue if vehicle.vehicle_type == "bus")
+            node_queues[edge.target][bucket] += queue_units
+            node_bus_queues[edge.target][bucket] += bus_queue_count
             node_edges[edge.target][bucket].append(edge_id)
-            downstream_queues[edge_id] = sum(len(self.edge_queues[outgoing.id]) for outgoing in self.outgoing_edges_by_node.get(edge.target, []))
+            downstream_queues[edge_id] = sum(self._queue_units(self.edge_queues[outgoing.id]) for outgoing in self.outgoing_edges_by_node.get(edge.target, []))
+            edge_bus_queues[edge_id] = bus_queue_count
             if self.capture_telemetry:
+                active_units = sum(vehicle.size_units for vehicle in self.edge_active[edge_id])
                 self.telemetry_rows.append(
                     {
                         "time_s": time_s,
@@ -305,17 +318,19 @@ class TrafficSimulation:
                         "sensor_id": f"sensor-{edge_id}",
                         "speed_mps": edge.length_m / max(self._edge_travel_time(edge_id), 1),
                         "count": len(self.edge_active[edge_id]),
-                        "occupancy_pct": min(100.0, 100.0 * len(self.edge_active[edge_id]) / max(1, edge.lane_count * 8)),
-                        "queue_len_m": len(queue) * 7.5,
+                        "occupancy_pct": min(100.0, 100.0 * active_units / max(1, edge.lane_count * 8)),
+                        "queue_len_m": queue_units * 7.5,
                         "quality_score": 1.0,
                     }
                 )
         return {
             "time_s": time_s,
             "node_queues": node_queues,
+            "node_bus_queues": node_bus_queues,
             "node_edges": node_edges,
             "downstream_queues": downstream_queues,
-            "edge_queues": {edge_id: len(queue) for edge_id, queue in self.edge_queues.items()},
+            "edge_queues": {edge_id: self._queue_units(queue) for edge_id, queue in self.edge_queues.items()},
+            "edge_bus_queues": edge_bus_queues,
             "node_phase_started": self.node_phase_started,
         }
 
@@ -323,22 +338,41 @@ class TrafficSimulation:
         vehicles = []
         for edge_id, active in self.edge_active.items():
             edge = self.network.edges[edge_id]
-            for vehicle in active[:12]:
+            visible = active[:18]
+            if len(active) > 18:
+                step = max(1, math.ceil((len(active) - 18) / 12))
+                visible += active[18::step][:12]
+            visible_ids = {vehicle.id for vehicle in visible}
+            visible += [
+                vehicle
+                for vehicle in active
+                if vehicle.vehicle_type == "bus" and vehicle.id not in visible_ids
+            ][:6]
+            for vehicle in visible:
                 progress = 1.0 - (vehicle.remaining_s / max(self._edge_travel_time(edge_id), 1))
-                x = edge.geometry[0][0] + (edge.geometry[-1][0] - edge.geometry[0][0]) * progress
-                y = edge.geometry[0][1] + (edge.geometry[-1][1] - edge.geometry[0][1]) * progress
-                vehicles.append({"id": vehicle.id, "edge_id": edge_id, "x": x, "y": y})
+                x, y = self._point_along_geometry(edge.geometry, progress)
+                vehicles.append(
+                    {
+                        "id": vehicle.id,
+                        "edge_id": edge_id,
+                        "x": x,
+                        "y": y,
+                        "vehicle_type": vehicle.vehicle_type,
+                        "route_name": vehicle.route_name,
+                    }
+                )
+        bus_completed = len([vehicle for vehicle in self.finished if vehicle.vehicle_type == "bus"])
         self.frames.append(
             {
                 "time_s": time_s,
                 "signals": dict(self.node_current_phase),
-                "queues": {edge_id: len(queue) for edge_id, queue in self.edge_queues.items()},
+                "queues": {edge_id: self._queue_units(queue) for edge_id, queue in self.edge_queues.items()},
                 "vehicles": vehicles,
             }
         )
         current_edge_times = [self._edge_travel_time(edge_id) for edge_id, edge in self.network.edges.items() if edge.enabled]
         avg_edge_time = sum(current_edge_times) / max(1, len(current_edge_times))
-        avg_queue = sum(len(queue) * 7.5 for queue in self.edge_queues.values()) / max(1, len(self.edge_queues))
+        avg_queue = sum(self._queue_units(queue) * 7.5 for queue in self.edge_queues.values()) / max(1, len(self.edge_queues))
         completed = len(self.finished)
         travel_time_index_s = round(avg_edge_time * 4 + (avg_queue / 6), 2)
         self.timeline.append(
@@ -347,34 +381,150 @@ class TrafficSimulation:
                 "travel_time_index_s": travel_time_index_s,
                 "avg_queue_len_m": round(avg_queue, 2),
                 "cars_through": completed,
+                "buses_through": bus_completed,
             }
         )
 
     def _compute_metrics(self) -> Dict[str, Any]:
-        finished_times = [vehicle.finished_at_s - vehicle.departed_at_s for vehicle in self.finished if vehicle.finished_at_s is not None]
-        delays = [
-            (vehicle.finished_at_s - vehicle.departed_at_s) - vehicle.total_free_flow_s
-            for vehicle in self.finished
-            if vehicle.finished_at_s is not None
-        ]
+        completed_vehicles = [vehicle for vehicle in self.finished if vehicle.finished_at_s is not None]
+        in_progress_vehicles = list(self.active_vehicles.values())
+        observed_vehicles = completed_vehicles + in_progress_vehicles
+        started_trips = [trip for trip in self.demand_profile.trips if trip.departure_s < self.duration_s]
+        started_car_trip_count = len([trip for trip in started_trips if trip.vehicle_type == "car"])
+        started_bus_trip_count = len([trip for trip in started_trips if trip.vehicle_type == "bus"])
+        projected_trip_times = [self._projected_trip_duration(vehicle) for vehicle in observed_vehicles]
+        projected_delays = [self._projected_trip_duration(vehicle) - vehicle.total_free_flow_s for vehicle in observed_vehicles]
+        bus_observed = [vehicle for vehicle in observed_vehicles if vehicle.vehicle_type == "bus"]
+        bus_projected_trip_times = [self._projected_trip_duration(vehicle) for vehicle in bus_observed]
+        bus_projected_delays = [self._projected_trip_duration(vehicle) - vehicle.total_free_flow_s for vehicle in bus_observed]
         avg_queue_len_m = 0.0
         if self.telemetry_rows:
             avg_queue_len_m = sum(row["queue_len_m"] for row in self.telemetry_rows) / len(self.telemetry_rows)
-        finished_times_sorted = sorted(finished_times)
-        p95 = finished_times_sorted[int(len(finished_times_sorted) * 0.95) - 1] if finished_times_sorted else 0.0
+        projected_times_sorted = sorted(projected_trip_times)
+        p95 = projected_times_sorted[max(0, int(len(projected_times_sorted) * 0.95) - 1)] if projected_times_sorted else 0.0
         incident_penalty = sum(
             row["queue_len_m"] for row in self.telemetry_rows if any(incident.edge_id == row["edge_id"] for incident in self.incidents)
         ) / max(1, len(self.telemetry_rows))
+        throughput = len(completed_vehicles)
+        bus_throughput = len([vehicle for vehicle in completed_vehicles if vehicle.vehicle_type == "bus"])
+        total_trip_count = len(self.demand_profile.trips)
+        bus_trip_count = len([trip for trip in self.demand_profile.trips if trip.vehicle_type == "bus"])
+        avg_travel_time_s = round(sum(projected_trip_times) / max(1, len(projected_trip_times)), 2)
+        total_delay_s = round(sum(projected_delays), 2)
+        bus_avg_travel_time_s = round(sum(bus_projected_trip_times) / max(1, len(bus_projected_trip_times)), 2)
+        bus_total_delay_s = round(sum(bus_projected_delays), 2)
+        completion_ratio_pct = round((throughput / max(1, len(started_trips))) * 100, 1)
+        bus_completion_ratio_pct = round((bus_throughput / max(1, started_bus_trip_count)) * 100, 1)
+        rail_riders_served = int(self.demand_profile.metadata.get("rail_riders_served", 0))
+        cars_removed_from_roads = int(self.demand_profile.metadata.get("mode_shift_removed_cars", 0))
+        people_moved = int(round(sum(self._person_movement_units(vehicle) for vehicle in observed_vehicles) + rail_riders_served))
+        city_flow_score = self._city_flow_score(
+            total_delay_s=total_delay_s,
+            avg_queue_len_m=avg_queue_len_m,
+            completion_ratio_pct=completion_ratio_pct,
+            bus_avg_travel_time_s=bus_avg_travel_time_s,
+            bus_completion_ratio_pct=bus_completion_ratio_pct,
+            incident_penalty=incident_penalty,
+            people_moved=people_moved,
+        )
         return {
-            "avg_travel_time_s": round(sum(finished_times) / max(1, len(finished_times)), 2),
-            "total_delay_s": round(sum(delays), 2),
-            "throughput": len(self.finished),
+            "avg_travel_time_s": avg_travel_time_s,
+            "total_delay_s": total_delay_s,
+            "throughput": throughput,
             "avg_queue_len_m": round(avg_queue_len_m, 2),
             "p95_travel_time_s": round(p95, 2),
             "incident_clearance_impact": round(incident_penalty, 2),
-            "completed_trip_count": len(self.finished),
-            "total_trip_count": len(self.demand_profile.trips),
+            "completed_trip_count": throughput,
+            "total_trip_count": total_trip_count,
+            "started_trip_count": len(started_trips),
+            "started_car_trip_count": started_car_trip_count,
+            "started_bus_trip_count": started_bus_trip_count,
+            "bus_avg_travel_time_s": bus_avg_travel_time_s,
+            "bus_total_delay_s": bus_total_delay_s,
+            "bus_throughput": bus_throughput,
+            "bus_trip_count": bus_trip_count,
+            "completion_ratio_pct": completion_ratio_pct,
+            "bus_completion_ratio_pct": bus_completion_ratio_pct,
+            "people_moved": people_moved,
+            "rail_riders_served": rail_riders_served,
+            "cars_removed_from_roads": cars_removed_from_roads,
+            "city_flow_score": city_flow_score,
         }
+
+    def _projected_trip_duration(self, vehicle: Vehicle) -> float:
+        if vehicle.finished_at_s is not None:
+            return float(vehicle.finished_at_s - vehicle.departed_at_s)
+        elapsed_s = max(0, self.duration_s - vehicle.departed_at_s)
+        remaining_s = max(vehicle.remaining_s, 0) + self._remaining_free_flow_s(vehicle)
+        return float(elapsed_s + remaining_s)
+
+    def _remaining_free_flow_s(self, vehicle: Vehicle) -> int:
+        if vehicle.segment_index >= len(vehicle.path) - 2:
+            return 0
+        total = 0
+        for source, target in zip(vehicle.path[vehicle.segment_index + 1 : -1], vehicle.path[vehicle.segment_index + 2 :]):
+            total += self._edge_between(source, target).base_travel_time_s
+        return total
+
+    def _person_movement_units(self, vehicle: Vehicle) -> float:
+        occupancy = 18.0 if vehicle.vehicle_type == "bus" else 1.2
+        return occupancy * self._vehicle_progress(vehicle)
+
+    def _vehicle_progress(self, vehicle: Vehicle) -> float:
+        if vehicle.finished_at_s is not None:
+            return 1.0
+        elapsed_s = max(0, self.duration_s - vehicle.departed_at_s)
+        projected_duration = max(1.0, self._projected_trip_duration(vehicle))
+        progress = elapsed_s / projected_duration
+        return max(0.0, min(0.98, progress))
+
+    def _queue_units(self, queue: Deque[Vehicle]) -> float:
+        return sum(vehicle.size_units for vehicle in queue)
+
+    def _city_flow_score(
+        self,
+        *,
+        total_delay_s: float,
+        avg_queue_len_m: float,
+        completion_ratio_pct: float,
+        bus_avg_travel_time_s: float,
+        bus_completion_ratio_pct: float,
+        incident_penalty: float,
+        people_moved: float,
+    ) -> float:
+        delay_score = max(0.0, 28.0 - total_delay_s / max(6.0, len(self.demand_profile.trips) * 0.18))
+        queue_score = max(0.0, 18.0 - avg_queue_len_m / 4.5)
+        completion_score = min(24.0, completion_ratio_pct * 0.24)
+        bus_speed_score = max(0.0, 18.0 - bus_avg_travel_time_s / 9.0) if any(trip.vehicle_type == "bus" for trip in self.demand_profile.trips) else 18.0
+        bus_completion_score = min(6.0, bus_completion_ratio_pct * 0.06)
+        incident_score = max(0.0, 6.0 - incident_penalty / 8.0)
+        people_score = min(10.0, people_moved / max(10.0, len(self.demand_profile.trips) * 0.7))
+        return round(delay_score + queue_score + completion_score + bus_speed_score + bus_completion_score + incident_score + people_score, 1)
+
+    def _point_along_geometry(self, geometry: List[tuple[float, float]], progress: float) -> tuple[float, float]:
+        if not geometry:
+            return (0.0, 0.0)
+        if len(geometry) == 1:
+            return geometry[0]
+        progress = max(0.0, min(1.0, progress))
+        segment_lengths = []
+        total_length = 0.0
+        for start, end in zip(geometry[:-1], geometry[1:]):
+            length = math.dist(start, end)
+            segment_lengths.append(length)
+            total_length += length
+        if total_length <= 0:
+            return geometry[-1]
+        distance_target = total_length * progress
+        traversed = 0.0
+        for length, start, end in zip(segment_lengths, geometry[:-1], geometry[1:]):
+            if traversed + length >= distance_target:
+                local = 0.0 if length == 0 else (distance_target - traversed) / length
+                x = start[0] + (end[0] - start[0]) * local
+                y = start[1] + (end[1] - start[1]) * local
+                return (x, y)
+            traversed += length
+        return geometry[-1]
 
 
 def evaluate_candidate_timings(
@@ -397,7 +547,13 @@ def evaluate_candidate_timings(
         capture_telemetry=False,
         capture_control_actions=False,
     ).run()
-    return float(result.metrics["avg_travel_time_s"])
+    return float(
+        result.metrics["avg_travel_time_s"]
+        + result.metrics.get("bus_avg_travel_time_s", 0.0) * 0.35
+        + result.metrics.get("avg_queue_len_m", 0.0) * 0.08
+        - result.metrics.get("people_moved", 0.0) * 0.02
+        - result.metrics.get("city_flow_score", 0.0) * 0.15
+    )
 
 
 def run_simulation(

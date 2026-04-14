@@ -6,14 +6,17 @@ const { useEffect, useMemo, useRef, useState } = React;
 const html = htm.bind(React.createElement);
 
 const API_URL = window.location.origin;
+const DEFAULT_AI_PROMPT = "In plain English, what happened here and what should the city do next?";
 const MAP_WIDTH = 1000;
 const MAP_HEIGHT = 640;
 const PREFERRED_MODES = ["fixed_time", "max_pressure", "ga_optimized"];
 const FEATURED_METRICS = [
+  "city_flow_score",
+  "people_moved",
   "avg_travel_time_s",
-  "total_delay_s",
   "throughput",
-  "avg_queue_len_m",
+  "bus_throughput",
+  "cars_removed_from_roads",
 ];
 
 const FALLBACK_UI = {
@@ -43,6 +46,20 @@ const FALLBACK_UI = {
 
 function fetchJson(path) {
   return fetch(`${API_URL}${path}`).then(async (response) => {
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `Request failed for ${path}`);
+    }
+    return response.json();
+  });
+}
+
+function postJson(path, payload) {
+  return fetch(`${API_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(async (response) => {
     if (!response.ok) {
       const text = await response.text();
       throw new Error(text || `Request failed for ${path}`);
@@ -142,22 +159,46 @@ function runOptionLabel(run) {
 
 function metricLabel(name) {
   return {
+    city_flow_score: "Traffic Flow Score",
     avg_travel_time_s: "Average Travel Time",
+    bus_avg_travel_time_s: "Average Bus Travel Time",
     total_delay_s: "Total Delay",
-    throughput: "Cars Through",
+    throughput: "Cars That Finished",
+    started_trip_count: "Trips Started",
+    started_car_trip_count: "Cars Entered The Map",
+    started_bus_trip_count: "Buses Entered The Map",
+    people_moved: "People Moved",
+    bus_throughput: "Buses That Finished",
+    rail_riders_served: "Rail Riders Served",
+    cars_removed_from_roads: "Cars Taken Off The Road",
     avg_queue_len_m: "Average Queue Length",
     p95_travel_time_s: "95th Percentile Travel Time",
     incident_clearance_impact: "Incident Impact",
+    completion_ratio_pct: "Trips Finished",
+    bus_completion_ratio_pct: "Bus Trips Finished",
   }[name] || name.replace(/_/g, " ");
 }
 
 function lowerIsBetter(metricName) {
-  return !["throughput", "cars_through"].includes(metricName);
+  return ![
+    "throughput",
+    "cars_through",
+    "bus_throughput",
+    "people_moved",
+    "rail_riders_served",
+    "cars_removed_from_roads",
+    "city_flow_score",
+    "completion_ratio_pct",
+    "bus_completion_ratio_pct",
+  ].includes(metricName);
 }
 
 function formatMetricValue(metricName, value) {
   if (value == null || Number.isNaN(Number(value))) {
     return "--";
+  }
+  if (metricName.includes("ratio_pct")) {
+    return `${Number(value).toFixed(1)}%`;
   }
   if (metricName.includes("travel_time") || metricName.includes("delay")) {
     return `${Math.round(Number(value)).toLocaleString()} s`;
@@ -165,10 +206,47 @@ function formatMetricValue(metricName, value) {
   if (metricName.includes("queue")) {
     return `${Math.round(Number(value)).toLocaleString()} m`;
   }
-  if (metricName.includes("throughput") || metricName.includes("cars")) {
+  if (metricName.includes("throughput") || metricName.includes("cars") || metricName.includes("started_trip")) {
     return Math.round(Number(value)).toLocaleString();
   }
+  if (metricName.includes("moved") || metricName.includes("riders")) {
+    return Math.round(Number(value)).toLocaleString();
+  }
+  if (metricName.includes("score")) {
+    return Number(value).toFixed(1);
+  }
   return Number(value).toFixed(1);
+}
+
+function resolveMetricValue(metricName, run, replay) {
+  const metrics = run?.metrics || replay?.metrics || {};
+  const networkSummary = replay?.network_summary || {};
+  if (metrics[metricName] != null) {
+    return metrics[metricName];
+  }
+  if (metricName === "throughput") {
+    return metrics.completed_trip_count ?? null;
+  }
+  if (metricName === "started_trip_count") {
+    if (metrics.total_trip_count != null) {
+      return metrics.total_trip_count;
+    }
+    const plannedTrips = (networkSummary.planned_car_trip_count || 0) + (networkSummary.planned_bus_trip_count || 0);
+    return plannedTrips || null;
+  }
+  if (metricName === "started_car_trip_count") {
+    if (metrics.total_trip_count != null && metrics.bus_trip_count != null) {
+      return Math.max(0, metrics.total_trip_count - metrics.bus_trip_count);
+    }
+    return networkSummary.planned_car_trip_count ?? null;
+  }
+  if (metricName === "started_bus_trip_count") {
+    return metrics.bus_trip_count ?? networkSummary.planned_bus_trip_count ?? null;
+  }
+  if (metricName === "bus_throughput") {
+    return metrics.buses_through ?? null;
+  }
+  return null;
 }
 
 function compareToBaseline(metricName, value, baselineValue) {
@@ -238,6 +316,40 @@ function pointsToPolyline(points) {
   return points.map(([x, y]) => `${x},${y}`).join(" ");
 }
 
+function nearestPointOnSegment(point, start, end) {
+  const [px, py] = point;
+  const [x1, y1] = start;
+  const [x2, y2] = end;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) {
+    return [x1, y1];
+  }
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lengthSquared));
+  return [x1 + dx * t, y1 + dy * t];
+}
+
+function nearestPointOnPolyline(point, polyline) {
+  if (!polyline?.length) {
+    return point;
+  }
+  if (polyline.length === 1) {
+    return polyline[0];
+  }
+  let bestPoint = polyline[0];
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < polyline.length - 1; index += 1) {
+    const candidate = nearestPointOnSegment(point, polyline[index], polyline[index + 1]);
+    const distance = Math.hypot(candidate[0] - point[0], candidate[1] - point[1]);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestPoint = candidate;
+    }
+  }
+  return bestPoint;
+}
+
 function useReplay(selectedIds) {
   const [state, setState] = useState({ loading: true, error: "", replays: {} });
 
@@ -284,6 +396,12 @@ function App() {
   const [speed, setSpeed] = useState(1);
   const [frameIndex, setFrameIndex] = useState(0);
   const [gifBusy, setGifBusy] = useState(false);
+  const [aiQuestion, setAiQuestion] = useState("In plain English, what happened here and which controller should I pay attention to?");
+  const [aiAnswer, setAiAnswer] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [aiMeta, setAiMeta] = useState(null);
+  const aiRequestRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -347,6 +465,7 @@ function App() {
     () => dedupeIds([selection.primary, selection.secondary, selection.tertiary]),
     [selection.primary, selection.secondary, selection.tertiary],
   );
+  const selectionKey = selectedIds.join("|");
 
   const replayState = useReplay(selectedIds);
   const runsById = useMemo(() => Object.fromEntries(runs.map((run) => [run.run_id, run])), [runs]);
@@ -371,6 +490,10 @@ function App() {
   const frameCount = useMemo(
     () => Math.max(0, ...selectedReplays.map((replay) => replay.frames.length)),
     [selectedReplays],
+  );
+  const featuredMetrics = useMemo(
+    () => (uiConfig.featured_metrics && uiConfig.featured_metrics.length ? uiConfig.featured_metrics : FEATURED_METRICS),
+    [uiConfig],
   );
 
   useEffect(() => {
@@ -418,24 +541,40 @@ function App() {
   }, [isPlaying, frameCount, speed]);
 
   const baselineRun = selectedRuns.find((run) => run.controller_mode === "fixed_time") || selectedRuns[0] || null;
+  const winnerMetric = useMemo(() => {
+    if (selectedRuns.some((run) => (run.metrics?.city_flow_score || 0) > 0)) {
+      return "city_flow_score";
+    }
+    return "avg_travel_time_s";
+  }, [selectedRuns]);
   const winnerRunId = useMemo(() => {
     if (!selectedRuns.length) {
       return "";
     }
-    const scoredRuns = selectedRuns.filter((run) => (run.metrics?.avg_travel_time_s || 0) > 0);
+    const scoredRuns = selectedRuns.filter((run) => run.metrics?.[winnerMetric] != null);
     if (!scoredRuns.length) {
       return "";
     }
-    return [...scoredRuns]
-      .sort((left, right) => (left.metrics?.avg_travel_time_s || Number.POSITIVE_INFINITY) - (right.metrics?.avg_travel_time_s || Number.POSITIVE_INFINITY))[0]
-      .run_id;
-  }, [selectedRuns]);
+    const sorted = [...scoredRuns].sort((left, right) => {
+      const leftValue = left.metrics?.[winnerMetric];
+      const rightValue = right.metrics?.[winnerMetric];
+      if (winnerMetric === "city_flow_score") {
+        if ((rightValue || 0) !== (leftValue || 0)) {
+          return (rightValue || 0) - (leftValue || 0);
+        }
+        return (left.metrics?.avg_travel_time_s || Number.POSITIVE_INFINITY) - (right.metrics?.avg_travel_time_s || Number.POSITIVE_INFINITY);
+      }
+      return (leftValue || Number.POSITIVE_INFINITY) - (rightValue || Number.POSITIVE_INFINITY);
+    });
+    return sorted[0]?.run_id || "";
+  }, [selectedRuns, winnerMetric]);
 
   const primaryScenario = selectedReplays[0]?.scenario || {
     title: "Run a comparison to see what changed",
     summary: "Pick up to three controller runs on the same road network to compare them side by side.",
     bullets: [],
   };
+  const networkSummary = selectedReplays[0]?.network_summary || null;
 
   const handlePrimaryChange = (runId) => {
     const nextPrimary = runsById[runId];
@@ -498,11 +637,65 @@ function App() {
       if (selection.secondary) {
         params.set("comparison", selection.secondary);
       }
+      if (selection.tertiary) {
+        params.set("tertiary", selection.tertiary);
+      }
       window.open(`${API_URL}/runs/export-gif?${params.toString()}`, "_blank", "noopener,noreferrer");
     } finally {
       window.setTimeout(() => setGifBusy(false), 400);
     }
   };
+
+  const askTrafficAnalyst = async (questionOverride) => {
+    if (!selectedIds.length) {
+      return;
+    }
+    const question = (questionOverride || aiQuestion || DEFAULT_AI_PROMPT).trim();
+    if (!question) {
+      return;
+    }
+    const requestId = aiRequestRef.current + 1;
+    aiRequestRef.current = requestId;
+    setAiQuestion(question);
+    setAiBusy(true);
+    setAiError("");
+    try {
+      const result = await postJson("/analysis/run-summary", {
+        run_ids: selectedIds,
+        question,
+      });
+      if (aiRequestRef.current !== requestId) {
+        return;
+      }
+      setAiAnswer(result.answer || "");
+      setAiMeta(result);
+    } catch (error) {
+      if (aiRequestRef.current !== requestId) {
+        return;
+      }
+      setAiError(error.message);
+    } finally {
+      if (aiRequestRef.current === requestId) {
+        setAiBusy(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    aiRequestRef.current += 1;
+    setAiAnswer("");
+    setAiError("");
+    setAiMeta(null);
+    setAiQuestion(DEFAULT_AI_PROMPT);
+    setAiBusy(false);
+  }, [selectionKey]);
+
+  useEffect(() => {
+    if (!selectedIds.length || replayState.loading || loadingRuns) {
+      return;
+    }
+    askTrafficAnalyst(DEFAULT_AI_PROMPT);
+  }, [selectionKey, replayState.loading, loadingRuns]);
 
   return html`
     <div className="app-shell">
@@ -517,7 +710,7 @@ function App() {
         <nav className="nav-tabs">
           <a href="http://127.0.0.1:8501/" className="nav-tab">Operator Console</a>
           <a href="/demo/" className="nav-tab nav-tab-active">Traffic Comparison Viewer</a>
-          <a href="/demo/architecture.html" className="nav-tab">Architecture</a>
+          <a href="/demo/architecture.html" className="nav-tab">Overview and Documentation</a>
         </nav>
       </header>
 
@@ -526,7 +719,7 @@ function App() {
           <div className="eyebrow">Traffic Comparison Viewer</div>
           <h1>Watch the cars move and see which controller actually keeps traffic flowing.</h1>
           <p className="hero-copy">
-            Compare up to three runs on the same road network, zoom into trouble spots, and read the results in plain English instead of traffic jargon.
+            Compare up to three runs on the same road network, zoom into trouble spots, and see how street changes, bus upgrades, and rail ideas affect the whole city in plain English.
           </p>
         </section>
         <section className="panel legend-panel">
@@ -590,7 +783,7 @@ function App() {
               </button>
             </div>
             <div className="inline-note" style=${{ marginTop: "12px" }}>
-              Scroll to zoom. Drag to pan. White dots are cars. Traffic-light markers show which direction currently has green.
+              Scroll to zoom. Drag to pan. White dots are cars. Amber bars are buses. Gold dashed lines mark planned rail or transit upgrades. Cross markers show which direction has the green light.
             </div>
           </section>
 
@@ -627,25 +820,34 @@ function App() {
             <div className="eyebrow">Scoreboard</div>
             <h3>Which controller is winning?</h3>
             <div className="scoreboard-list">
-              ${selectedRuns.length
-                ? selectedRuns.map(
-                    (run) => html`
-                      <div className=${`score-card ${run.run_id === winnerRunId ? "best" : ""}`} key=${run.run_id}>
-                        <div className="score-card-head">
-                          <div className="series-chip">
-                            <span className="badge" style=${{ background: run.controller.badge_color }}></span>
-                            <span>${run.controller.short}</span>
-                          </div>
-                          ${run.run_id === winnerRunId ? html`<span className="winner-flag">Best Result</span>` : null}
-                        </div>
-                        <div className="score-main-value">${formatMetricValue("avg_travel_time_s", run.metrics?.avg_travel_time_s)}</div>
-                        <div className=${`metric-delta ${compareToBaseline("avg_travel_time_s", run.metrics?.avg_travel_time_s, baselineRun?.metrics?.avg_travel_time_s).className}`}>
-                          ${compareToBaseline("avg_travel_time_s", run.metrics?.avg_travel_time_s, baselineRun?.metrics?.avg_travel_time_s).text}
-                        </div>
-                      </div>
-                    `,
-                  )
-                : html`<div className="empty-state compact">Choose a few runs to rank the controllers.</div>`}
+	              ${selectedRuns.length
+	                ? selectedRuns.map(
+	                    (run) => {
+                        const replay = replayState.replays[run.run_id];
+                        const metricValue = resolveMetricValue(winnerMetric, run, replay);
+                        const baselineValue = baselineRun
+                          ? resolveMetricValue(winnerMetric, baselineRun, replayState.replays[baselineRun.run_id])
+                          : null;
+                        const baselineComparison = compareToBaseline(winnerMetric, metricValue, baselineValue);
+                        return html`
+	                      <div className=${`score-card ${run.run_id === winnerRunId ? "best" : ""}`} key=${run.run_id}>
+	                      <div className="score-card-head">
+	                          <div className="series-chip">
+	                            <span className="badge" style=${{ background: run.controller.badge_color }}></span>
+	                            <span>${run.controller.short}</span>
+	                          </div>
+	                          ${run.run_id === winnerRunId ? html`<span className="winner-flag">Best Result</span>` : null}
+	                        </div>
+	                        <div className="score-label">${metricLabel(winnerMetric)}</div>
+	                        <div className="score-main-value">${formatMetricValue(winnerMetric, metricValue)}</div>
+	                        <div className=${`metric-delta ${baselineComparison.className}`}>
+	                          ${baselineComparison.text}
+	                        </div>
+	                      </div>
+	                    `;
+                      },
+	                  )
+	                : html`<div className="empty-state compact">Choose a few runs to rank the controllers.</div>`}
             </div>
           </section>
         </aside>
@@ -663,7 +865,7 @@ function App() {
                           <div className="eyebrow">Live Replay</div>
                           <h3>Three smart controllers on the same map</h3>
                           <p className="helper-text">
-                            The map only shows real traffic lights, moving cars, and road segments that are filling up with queues.
+                            The map shows moving cars, buses, live traffic-light state, and road segments that are filling up with queues.
                           </p>
                         </div>
                         <div className="run-pill-group">
@@ -677,7 +879,7 @@ function App() {
                           )}
                         </div>
                       </div>
-                      <div className="maps-grid">
+                      <div className=${`maps-grid maps-grid-${selectedReplays.length}`}>
                         ${selectedReplays.map(
                           (replay) => html`
                             <${ReplayMap}
@@ -685,6 +887,7 @@ function App() {
                               replay=${replay}
                               frameIndex=${frameIndex}
                               isWinner=${replay.run_id === winnerRunId}
+                              isPlaying=${isPlaying}
                             />
                           `,
                         )}
@@ -692,6 +895,61 @@ function App() {
                     </section>
 
                     <section className="insights-grid">
+                      <section className="panel">
+                        <div className="eyebrow">AI Traffic Analyst</div>
+                        <h3>Ask for a plain-English readout</h3>
+                        <p className="helper-text">
+                          ${uiConfig.analyst?.available
+                            ? "Powered by Grok through the server-side xAI integration."
+                            : "Using a deterministic fallback summary if the external model is unavailable."}
+                        </p>
+                        <div className="inline-note" style=${{ marginBottom: "12px" }}>
+                          The analyst now explains the currently selected runs automatically. Use the quick prompts below if you want to dig deeper.
+                        </div>
+                        <div className="prompt-chip-row">
+                          ${[
+                            "In plain English, what happened here?",
+                            "What should the city do next?",
+                            "What is the clearest takeaway?",
+                            "What should I notice in the replay?",
+                          ].map(
+                            (prompt) => html`
+                              <button
+                                key=${prompt}
+                                className="secondary-button chip-button"
+                                onClick=${() => askTrafficAnalyst(prompt)}
+                                disabled=${aiBusy || !selectedIds.length}
+                              >
+                                ${prompt}
+                              </button>
+                            `,
+                          )}
+                        </div>
+                        <label>
+                          <span className="field-label">Ask a follow-up</span>
+                          <textarea
+                            className="analyst-input"
+                            value=${aiQuestion}
+                            onChange=${(event) => setAiQuestion(event.target.value)}
+                            placeholder="Why did this controller win, and what is the clearest takeaway?"
+                          ></textarea>
+                        </label>
+                        <div className="controls-row">
+                          <button className="primary-button" onClick=${() => askTrafficAnalyst()} disabled=${aiBusy || !selectedIds.length}>
+                            ${aiBusy ? "Asking AI Traffic Analyst..." : "Ask AI Traffic Analyst"}
+                          </button>
+                        </div>
+                        ${aiError ? html`<div className="inline-note">${aiError}</div>` : null}
+                        ${aiAnswer
+                          ? html`
+                              <div className="ai-answer">${aiAnswer}</div>
+                              <div className="ai-meta">
+                                ${aiMeta?.used_ai ? "Source: Grok via xAI." : "Source: deterministic fallback summary."}
+                              </div>
+                            `
+                          : html`<div className="empty-state compact">Ask “What should the city do next?” for a plain-English recommendation.</div>`}
+                      </section>
+
                       <section className="panel">
                         <div className="eyebrow">Travel Time Trend</div>
                         <h3>How traffic changed over time</h3>
@@ -708,27 +966,64 @@ function App() {
                       </section>
 
                       <section className="panel">
+                        <div className="eyebrow">What Powers This Demo</div>
+                        <h3>${networkSummary?.name || "City Traffic Model"}</h3>
+                        <p className="legend-copy">
+                          ${networkSummary
+                            ? `This run uses ${networkSummary.bus_route_count || 0} scheduled bus routes, ${networkSummary.rail_line_count || 0} planned rail corridors, and a bundle of simulated city data feeds.`
+                            : "Pick a run to see the city inputs and transit assumptions behind this simulation."}
+                        </p>
+                        <div className="summary-metric">
+                          <span>Traffic Level</span>
+                          <strong>${formatTrafficScale(networkSummary?.traffic_scale)}</strong>
+                        </div>
+                        <div className="summary-metric">
+                          <span>Planned Car Trips</span>
+                          <strong>${networkSummary?.planned_car_trip_count || 0}</strong>
+                        </div>
+                        <div className="summary-metric">
+                          <span>Map Type</span>
+                          <strong>${networkSummary?.source_type === "osm" ? "Real Neighborhood Map" : "Built-In Demo Grid"}</strong>
+                        </div>
+                        <div className="summary-metric">
+                          <span>Bus Routes</span>
+                          <strong>${networkSummary?.bus_route_count || 0}</strong>
+                        </div>
+                        <div className="summary-metric">
+                          <span>Planned Rail Corridors</span>
+                          <strong>${networkSummary?.rail_line_count || 0}</strong>
+                        </div>
+                        <div className="summary-metric">
+                          <span>Cars Taken Off The Road</span>
+                          <strong>${networkSummary?.cars_removed_from_roads || 0}</strong>
+                        </div>
+                        <div className="feed-list">
+                          ${(networkSummary?.city_inputs || []).map((feed) => html`<div className="feed-pill" key=${feed}>${feed}</div>`)}
+                        </div>
+                      </section>
+
+                      <section className="panel">
                         <div className="eyebrow">Key Numbers</div>
                         <h3>Quick read on each selected run</h3>
                         <div className="run-summary-grid">
-                          ${selectedRuns.map(
-                            (run) => html`
-                              <div className="summary-card" key=${run.run_id}>
-                                <div className="summary-card-head">
-                                  <span className="series-chip">
-                                    <span className="badge" style=${{ background: run.controller.badge_color }}></span>
-                                    ${run.controller.short}
+	                          ${selectedRuns.map(
+	                            (run) => html`
+	                              <div className="summary-card" key=${run.run_id}>
+	                                <div className="summary-card-head">
+	                                  <span className="series-chip">
+	                                    <span className="badge" style=${{ background: run.controller.badge_color }}></span>
+	                                    ${run.controller.short}
                                   </span>
                                   ${run.run_id === winnerRunId ? html`<span className="winner-flag">Best</span>` : null}
                                 </div>
-                                ${FEATURED_METRICS.map(
-                                  (metricName) => html`
-                                    <div className="summary-metric" key=${metricName}>
-                                      <span>${metricLabel(metricName)}</span>
-                                      <strong>${formatMetricValue(metricName, run.metrics?.[metricName])}</strong>
-                                    </div>
-                                  `,
-                                )}
+	                                ${featuredMetrics.map(
+	                                  (metricName) => html`
+	                                    <div className="summary-metric" key=${metricName}>
+	                                      <span>${metricLabel(metricName)}</span>
+	                                      <strong>${formatMetricValue(metricName, resolveMetricValue(metricName, run, replayState.replays[run.run_id]))}</strong>
+	                                    </div>
+	                                  `,
+	                                )}
                               </div>
                             `,
                           )}
@@ -743,7 +1038,26 @@ function App() {
   `;
 }
 
-function ReplayMap({ replay, frameIndex, isWinner }) {
+function formatTrafficScale(scale) {
+  if (!scale) {
+    return "City Rush";
+  }
+  if (Math.abs(scale - 0.75) < 0.01) {
+    return "Light";
+  }
+  if (Math.abs(scale - 1.0) < 0.01) {
+    return "City Rush";
+  }
+  if (Math.abs(scale - 1.5) < 0.01) {
+    return "Heavy";
+  }
+  if (Math.abs(scale - 2.2) < 0.01) {
+    return "Gridlock";
+  }
+  return `${scale.toFixed(1)}x`;
+}
+
+function ReplayMap({ replay, frameIndex, isWinner, isPlaying }) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
@@ -783,10 +1097,12 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
     () =>
       lineFeatures.map((feature) => ({
         id: feature.properties.id,
+        rawPoints: feature.geometry.coordinates,
         points: feature.geometry.coordinates.map(([x, y]) => projection.projectPoint(x, y)),
       })),
     [lineFeatures, projection],
   );
+  const lineLookup = useMemo(() => new Map(projectedLines.map((line) => [line.id, line])), [projectedLines]);
   const projectedSignals = useMemo(
     () =>
       signalFeatures.map((feature) => ({
@@ -803,9 +1119,25 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
       })),
     [projection, roundaboutFeatures],
   );
+  const transitOverlays = replay.network_summary?.transit_overlays || [];
+  const projectedTransitOverlays = useMemo(
+    () =>
+      transitOverlays.map((overlay, index) => ({
+        id: `${overlay.type || "transit"}-${overlay.name || index}-${index}`,
+        name: overlay.name || "Transit Upgrade",
+        type: overlay.type || "transit",
+        color: overlay.color || "#F59E0B",
+        points: (overlay.geometry || []).map(([x, y]) => projection.projectPoint(x, y)),
+      })),
+    [projection, transitOverlays],
+  );
 
-  const vehicleStep = Math.max(1, Math.ceil((frame.vehicles || []).length / 550));
-  const visibleVehicles = (frame.vehicles || []).filter((_, index) => index % vehicleStep === 0);
+  const allVehicles = frame.vehicles || [];
+  const buses = allVehicles.filter((vehicle) => vehicle.vehicle_type === "bus");
+  const cars = allVehicles.filter((vehicle) => vehicle.vehicle_type !== "bus");
+  const vehicleStep = Math.max(1, Math.ceil(cars.length / 420));
+  const visibleCars = cars.filter((_, index) => index % vehicleStep === 0);
+  const visibleVehicles = [...visibleCars, ...buses];
   const worstQueue = Math.max(0, ...Object.values(frame.queues || {}));
 
   const updateZoom = (nextZoom) => {
@@ -854,9 +1186,11 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
           <div className="map-title">${replay.controller.display}</div>
           <div className="map-copy">${replay.controller.description}</div>
           <div className="map-stat-row">
-            <span className="stat-pill">${visibleVehicles.length} cars shown</span>
+            <span className="stat-pill">${visibleCars.length} cars shown</span>
+            <span className="stat-pill">${buses.length} buses shown</span>
             <span className="stat-pill">${projectedSignals.length} traffic lights</span>
-            <span className="stat-pill">${Math.round(worstQueue)} cars in the worst queue</span>
+            <span className="stat-pill">${projectedTransitOverlays.length} transit upgrade${projectedTransitOverlays.length === 1 ? "" : "s"}</span>
+            <span className="stat-pill">${Math.round(worstQueue)} vehicles in the worst queue</span>
           </div>
         </div>
         <div className="time-chip">t = ${Math.round(frame.time_s || 0)}s</div>
@@ -882,6 +1216,42 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
           </defs>
 
           <g transform=${transform}>
+            ${projectedTransitOverlays.map((overlay) => {
+              if (overlay.points.length < 2) {
+                return null;
+              }
+              return html`
+                <polyline
+                  key=${`${overlay.id}-overlay`}
+                  className=${`transit-overlay transit-overlay-${overlay.type}`}
+                  points=${pointsToPolyline(overlay.points)}
+                  fill="none"
+                  stroke=${overlay.color}
+                  strokeWidth=${overlay.type === "rail" ? 8 : 6}
+                  strokeDasharray=${overlay.type === "rail" ? "18 10" : "10 8"}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  opacity="0.72"
+                />
+              `;
+            })}
+
+            ${projectedLines.map((line) => {
+              return html`
+                <polyline
+                  key=${`${line.id}-base`}
+                  className="road-base"
+                  points=${pointsToPolyline(line.points)}
+                  fill="none"
+                  stroke="rgba(113, 212, 255, 0.18)"
+                  strokeWidth="4.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  opacity="0.9"
+                />
+              `;
+            })}
+
             ${projectedLines.map((line) => {
               const queue = frame.queues?.[line.id] || 0;
               return html`
@@ -891,10 +1261,10 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
                   points=${pointsToPolyline(line.points)}
                   fill="none"
                   stroke=${queueColor(queue)}
-                  strokeWidth=${2.1 + Math.min(queue, 12) * 0.45}
+                  strokeWidth=${2.5 + Math.min(queue, 12) * 0.55}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  opacity=${0.9}
+                  opacity=${0.98}
                   filter=${`url(#glow-${replay.run_id})`}
                 />
               `;
@@ -924,11 +1294,35 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
             })}
 
             ${visibleVehicles.map((vehicle, index) => {
-              const [x, y] = projection.projectPoint(vehicle.x, vehicle.y);
+              const edge = lineLookup.get(vehicle.edge_id);
+              const snappedPoint = edge
+                ? nearestPointOnPolyline([vehicle.x, vehicle.y], edge.rawPoints)
+                : [vehicle.x, vehicle.y];
+              const [x, y] = projection.projectPoint(snappedPoint[0], snappedPoint[1]);
+              if (vehicle.vehicle_type === "bus") {
+                return html`
+                  <g key=${`${replay.run_id}-bus-${index}`}>
+                    <rect
+                      className=${`bus-marker ${isPlaying ? "moving" : ""}`}
+                      x=${x - 4.8}
+                      y=${y - 2.8}
+                      rx="2"
+                      ry="2"
+                      width="9.6"
+                      height="5.6"
+                      fill="#F59E0B"
+                      stroke="#FEF3C7"
+                      strokeWidth="0.9"
+                      opacity="0.98"
+                    />
+                    ${vehicle.route_name ? html`<title>${vehicle.route_name}</title>` : null}
+                  </g>
+                `;
+              }
               return html`
                 <circle
                   key=${`${replay.run_id}-car-${index}`}
-                  className="car-dot moving"
+                  className=${`car-dot ${isPlaying ? "moving" : ""}`}
                   cx=${x}
                   cy=${y}
                   r="2.5"
@@ -971,6 +1365,10 @@ function ReplayMap({ replay, frameIndex, isWinner }) {
 
         <div className="map-key">
           <div className="map-key-item"><span className="map-key-swatch map-key-cars"></span>White dots = cars</div>
+          <div className="map-key-item"><span className="map-key-swatch map-key-bus"></span>Amber bars = buses</div>
+          ${projectedTransitOverlays.some((overlay) => overlay.type === "rail")
+            ? html`<div className="map-key-item"><span className="map-key-swatch map-key-rail"></span>Gold dashed line = planned rail corridor</div>`
+            : null}
           <div className="map-key-item"><span className="map-key-swatch map-key-signal"></span>Cross markers = traffic lights</div>
           <div className="map-key-item"><span className="map-key-swatch map-key-queue"></span>Warm roads = growing queues</div>
           <div className="zoom-note">Drag to pan. Scroll to zoom.</div>
